@@ -26,4 +26,15 @@ jobs:
         with:
           node-version: 22
       - run: npm install
-      - run: npm run typecheck
+      - name: Typecheck
+        run: |
+          set +e
+          npm run typecheck > typecheck.log 2>&1
+          code=$?
+          cat typecheck.log
+          exit $code
+      - if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: frontend-typecheck-log
+          path: typecheck.log
