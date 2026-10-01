@@ -6,7 +6,7 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports: ["5432:5432"]
-    volumes: [scribelink_pg:/var/lib/postgresql/data]
+    volumes:\n      - scribelink_pg:/var/lib/postgresql/data\n      - ./backend/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
