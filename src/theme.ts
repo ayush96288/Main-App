@@ -1,1 +1,3 @@
-export const colors={ink:"#101114",muted:"#737780",surface:"#F7F7F8",card:"#FFFFFF",line:"#E8E8EC",accent:"#007AFF",accentSoft:"#EAF3FF",green:"#24A148",orange:"#F59E0B",red:"#E5484D"}; export const radius={sm:12,md:18,lg:28,pill:999};
+export const colors={ink:"#0B0C0F",inkSoft:"#17191E",muted:"#747780",surface:"#F5F5F7",card:"#FFFFFF",line:"#E7E7EB",accent:"#007AFF",accentSoft:"#EAF3FF",green:"#22A06B",greenSoft:"#EAF8F1",orange:"#F59E0B",orangeSoft:"#FFF5DF",red:"#E5484D",redSoft:"#FDEBEC",purple:"#7C5CFC"};
+export const radius={sm:12,md:18,lg:26,xl:34,pill:999};
+export const shadow={card:{shadowColor:"#000",shadowOpacity:0.06,shadowRadius:18,shadowOffset:{width:0,height:8},elevation:3}};
