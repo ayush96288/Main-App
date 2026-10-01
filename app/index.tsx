@@ -1,11 +1,11 @@
 import {useEffect,useState} from "react";
 import {Pressable,ScrollView,StyleSheet,Text,View} from "react-native";
 import {router} from "expo-router";
-import {getToken} from "@/api";
+import {api} from "@/api";
 import {colors,radius,shadow} from "@/theme";
 
 export default function Home(){
-  useEffect(()=>{getToken().then(token=>{if(!token) router.replace("/auth")})},[]);
+  useEffect(()=>{api("/me").then(response=>{if(!response.ok) router.replace("/auth")})},[]);
   const [mode,setMode]=useState<"customer"|"scribe">("customer");
   return <ScrollView style={s.page} contentContainerStyle={s.content}>
     <View style={s.top}><View><Text style={s.eyebrow}>SCRIBELINK</Text><Text style={s.title}>Good evening.</Text></View><View style={s.avatar}><Text style={s.avatarText}>A</Text></View></View>
