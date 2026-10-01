@@ -1,0 +1,3 @@
+import type {Request,Response,NextFunction} from "express";import {verifyAccessToken} from "./security.js";
+export function auth(req:Request,res:Response,next:NextFunction){const h=req.header("authorization");if(!h?.startsWith("Bearer "))return res.status(401).json({error:"unauthorized"});try{(req as any).user=verifyAccessToken(h.slice(7));next()}catch{return res.status(401).json({error:"invalid_session"})}}
+export function role(...roles:string[]){return(req:Request,res:Response,next:NextFunction)=>{const r=(req as any).user?.role;if(!roles.includes(r))return res.status(403).json({error:"forbidden"});next()}}
