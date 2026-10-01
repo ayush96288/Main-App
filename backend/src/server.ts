@@ -1,0 +1,13 @@
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
+import {z} from "zod";
+import jwt from "jsonwebtoken";
+const app=express(); app.use(cors()); app.use(express.json({limit:"10mb"}));
+const secret=process.env.JWT_SECRET; if(!secret) throw new Error("JWT_SECRET is required");
+const orders=new Map<string,{id:string,pages:number,price:number,status:string}>();
+app.get("/health",(_,res)=>res.json({ok:true,service:"scribelink-api"}));
+app.post("/auth/dev-login",(req,res)=>{const body=z.object({role:z.enum(["CUSTOMER","SCRIBE"]),phone:z.string().min(8)}).safeParse(req.body);if(!body.success)return res.status(400).json({error:"invalid_request"});const accessToken=jwt.sign({sub:"demo-user",role:body.data.role},secret,{expiresIn:"15m"});const refreshToken=jwt.sign({sub:"demo-user",type:"refresh"},secret,{expiresIn:"30d"});res.json({accessToken,refreshToken,role:body.data.role});});
+app.post("/orders",(req,res)=>{const body=z.object({pages:z.number().int().positive().max(500),scribeId:z.string().optional()}).safeParse(req.body);if(!body.success)return res.status(400).json({error:"invalid_request"});const id="SL-"+Math.floor(100000+Math.random()*899999);const order={id,pages:body.data.pages,price:body.data.pages*30,status:"PAID_PENDING_ACCEPTANCE"};orders.set(id,order);res.status(201).json(order);});
+app.get("/orders/:id",(req,res)=>{const order=orders.get(req.params.id);if(!order)return res.status(404).json({error:"not_found"});res.json(order);});
+app.listen(Number(process.env.PORT||4000),()=>console.log("ScribeLink API listening"));
