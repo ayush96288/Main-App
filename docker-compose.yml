@@ -6,7 +6,9 @@ services:
       POSTGRES_USER: postgres
       POSTGRES_PASSWORD: postgres
     ports: ["5432:5432"]
-    volumes:\n      - scribelink_pg:/var/lib/postgresql/data\n      - ./backend/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
+    volumes:
+      - scribelink_pg:/var/lib/postgresql/data
+      - ./backend/schema.sql:/docker-entrypoint-initdb.d/001-schema.sql:ro
   minio:
     image: minio/minio:latest
     command: server /data --console-address ":9001"
@@ -14,7 +16,14 @@ services:
       MINIO_ROOT_USER: minio
       MINIO_ROOT_PASSWORD: miniosecret
     ports: ["9000:9000","9001:9001"]
-    volumes: [scribelink_objects:/data]
+    volumes:
+      - scribelink_objects:/data
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      - minio
+    entrypoint: ["/bin/sh","-c"]
+    command: "until mc alias set local http://minio:9000 minio miniosecret; do sleep 1; done; mc mb --ignore-existing local/scribelink; exit 0"
 volumes:
   scribelink_pg:
   scribelink_objects:
