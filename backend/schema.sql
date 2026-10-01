@@ -1,0 +1,13 @@
+CREATE EXTENSION IF NOT EXISTS pgcrypto;
+CREATE TYPE user_role AS ENUM ('CUSTOMER','SCRIBE','ADMIN');
+CREATE TYPE order_status AS ENUM ('DRAFT','PAID_PENDING_ACCEPTANCE','SCRIBE_ACCEPTED','IN_PROGRESS','QUALITY_CHECK','DISPATCHED','DELIVERED_TO_GATE','ESCROW_HOLD','SETTLED','CANCELLED');
+CREATE TABLE IF NOT EXISTS users(id UUID PRIMARY KEY DEFAULT gen_random_uuid(), phone_e164 TEXT NOT NULL UNIQUE, role user_role NOT NULL DEFAULT 'CUSTOMER', is_active BOOLEAN NOT NULL DEFAULT TRUE, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS auth_challenges(id UUID PRIMARY KEY DEFAULT gen_random_uuid(), phone_e164 TEXT NOT NULL, otp_hash TEXT NOT NULL, expires_at TIMESTAMPTZ NOT NULL, attempts INTEGER NOT NULL DEFAULT 0, consumed_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS auth_challenges_phone_idx ON auth_challenges(phone_e164,created_at DESC);
+CREATE TABLE IF NOT EXISTS sessions(id UUID PRIMARY KEY DEFAULT gen_random_uuid(), user_id UUID NOT NULL REFERENCES users(id) ON DELETE CASCADE, refresh_token_hash TEXT NOT NULL UNIQUE, expires_at TIMESTAMPTZ NOT NULL, revoked_at TIMESTAMPTZ, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions(user_id,expires_at);
+CREATE TABLE IF NOT EXISTS orders(id UUID PRIMARY KEY DEFAULT gen_random_uuid(), public_id TEXT NOT NULL UNIQUE, customer_id UUID NOT NULL REFERENCES users(id), scribe_id UUID REFERENCES users(id), pages INTEGER NOT NULL CHECK(pages BETWEEN 1 AND 500), word_count INTEGER CHECK(word_count>=0), price_paise INTEGER NOT NULL CHECK(price_paise>=0), payout_paise INTEGER NOT NULL CHECK(payout_paise>=0), status order_status NOT NULL DEFAULT 'DRAFT', acceptance_deadline TIMESTAMPTZ, version INTEGER NOT NULL DEFAULT 0, created_at TIMESTAMPTZ NOT NULL DEFAULT now(), updated_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS orders_customer_idx ON orders(customer_id,created_at DESC);
+CREATE INDEX IF NOT EXISTS orders_scribe_idx ON orders(scribe_id,status,created_at DESC);
+CREATE TABLE IF NOT EXISTS order_events(id UUID PRIMARY KEY DEFAULT gen_random_uuid(), order_id UUID NOT NULL REFERENCES orders(id) ON DELETE CASCADE, from_status order_status, to_status order_status NOT NULL, actor_user_id UUID REFERENCES users(id), metadata JSONB NOT NULL DEFAULT '{}'::jsonb, created_at TIMESTAMPTZ NOT NULL DEFAULT now());
+CREATE INDEX IF NOT EXISTS order_events_order_idx ON order_events(order_id,created_at);
