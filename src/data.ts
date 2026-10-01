@@ -1,0 +1,1 @@
+export type OrderStatus="Finding writer"|"Accepted"|"Writing"|"Quality check"|"Dispatched"; export const scribes=[{id:"S-102",name:"Scribe #102",style:"Clean cursive",rating:4.9,jobs:86},{id:"S-318",name:"Scribe #318",style:"Neat print",rating:4.8,jobs:54},{id:"S-221",name:"Scribe #221",style:"Compact cursive",rating:4.9,jobs:112}];
