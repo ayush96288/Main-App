@@ -1,0 +1,1 @@
+export const colors={ink:"#101114",muted:"#737780",surface:"#F7F7F8",card:"#FFFFFF",line:"#E8E8EC",accent:"#007AFF",accentSoft:"#EAF3FF",green:"#24A148",orange:"#F59E0B",red:"#E5484D"}; export const radius={sm:12,md:18,lg:28,pill:999};
