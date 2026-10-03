@@ -1,22 +1,196 @@
-import"dotenv/config";import express from"express";import cors from"cors";import helmet from"helmet";import rateLimit from"express-rate-limit";import{z}from"zod";import{auth,role}from"./middleware.js";import{hashToken,issueAccessToken,issueRefreshToken,otp,requestId}from"./security.js";import{pool,withTx}from"./db.js";import{canTransition,orderAmounts,publicOrderId}from"./domain.js";import{marketplace,publicMarketplace}from"./marketplace.js";
-const app=express();app.disable("x-powered-by");app.set("trust proxy",1);app.use(helmet({crossOriginResourcePolicy:{policy:"same-site"}}));app.use(cors({origin:process.env.WEB_ORIGIN?.split(",").map(x=>x.trim())||false,credentials:true}));app.use(express.json({limit:"1mb",verify:(req:any,_res,buf)=>{req.rawBody=Buffer.from(buf)}}));app.use((req,res,next)=>{res.setHeader("x-request-id",requestId());res.setHeader("Cache-Control","no-store");next()});app.use(rateLimit({windowMs:60_000,max:120,standardHeaders:true,legacyHeaders:false}));app.get("/health",(_,res)=>res.status(200).json({ok:true,service:"scribelink-api"}));app.get("/healthz",(_,res)=>res.status(200).json({ok:true,service:"scribelink-api"}));app.use(publicMarketplace);app.use(marketplace);
-const otpLimit=rateLimit({windowMs:10*60_000,max:5,standardHeaders:true,legacyHeaders:false});const otpVerifyLimit=rateLimit({windowMs:10*60_000,max:10,standardHeaders:true,legacyHeaders:false});
-function cookie(req:express.Request,name:string){const raw=req.header("cookie")||"";return raw.split(";").map(x=>x.trim()).find(x=>x.startsWith(name+"="))?.slice(name.length+1)}
-const prod=process.env.NODE_ENV==="production";
-const refreshCookieName=prod?"__Host-refresh_token":"refresh_token";
-const accessCookieName=prod?"__Host-access_token":"access_token";
-function setRefresh(res:express.Response,value:string){res.setHeader("Set-Cookie",`${refreshCookieName}=${value}; Max-Age=2592000; Path=/; HttpOnly; ${prod?"Secure; ":""}SameSite=Lax`)}
-function setAccess(res:express.Response,value:string){res.append("Set-Cookie",`${accessCookieName}=${value}; Max-Age=900; Path=/; HttpOnly; ${prod?"Secure; ":""}SameSite=Lax`)}
-function clearCookies(res:express.Response){const secure=prod?"Secure; ":"";res.setHeader("Set-Cookie",[`${refreshCookieName}=; Max-Age=0; Path=/; HttpOnly; ${secure}SameSite=Lax`,`${accessCookieName}=; Max-Age=0; Path=/; HttpOnly; ${secure}SameSite=Lax`])}
-app.get("/health",async(_,res)=>{try{await pool.query("SELECT 1");res.json({ok:true,service:"scribelink-api"})}catch{res.status(503).json({ok:false})}});
-app.post("/auth/request-otp",otpLimit,async(req,res)=>{const parsed=z.object({phone:z.string().trim().regex(/^\\+[1-9]\\d{7,14}$/)}).safeParse(req.body);if(!parsed.success)return res.status(400).json({error:"invalid_request"});const phone=parsed.data.phone;const code=otp();await pool.query("INSERT INTO auth_challenges(phone_e164,otp_hash,expires_at) VALUES($1,$2,now()+interval '5 minutes')",[phone,hashToken(code)]);res.json({accepted:true,expiresIn:300,developmentOtp:process.env.NODE_ENV==="development"?code:undefined})});
-app.post("/auth/verify-otp",otpVerifyLimit,async(req,res)=>{const parsed=z.object({phone:z.string().trim().regex(/^\\+[1-9]\\d{7,14}$/),code:z.string().regex(/^\\d{6}$/),client:z.enum(["web","native"]).default("native")}).safeParse(req.body);if(!parsed.success)return res.status(400).json({error:"invalid_request"});const{phone,code}=parsed.data;const result=await withTx(async c=>{const q=await c.query("SELECT id,otp_hash,expires_at,attempts FROM auth_challenges WHERE phone_e164=$1 AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1 FOR UPDATE",[phone]);const ch=q.rows[0];if(!ch||new Date(ch.expires_at)<new Date()||ch.attempts>=5)throw new Error("invalid_otp");if(hashToken(code)!==ch.otp_hash){await c.query("UPDATE auth_challenges SET attempts=attempts+1 WHERE id=$1",[ch.id]);throw new Error("invalid_otp")}await c.query("UPDATE auth_challenges SET consumed_at=now() WHERE id=$1",[ch.id]);const u=await c.query("INSERT INTO users(phone_e164) VALUES($1) ON CONFLICT(phone_e164) DO UPDATE SET updated_at=now() RETURNING id,role",[phone]);const refresh=issueRefreshToken();await c.query("INSERT INTO sessions(user_id,refresh_token_hash,expires_at) VALUES($1,$2,now()+interval '30 days')",[u.rows[0].id,hashToken(refresh)]);return{user:u.rows[0],refresh}}).catch(()=>null);if(!result)return res.status(401).json({error:"invalid_otp"});const access=issueAccessToken(result.user.id,result.user.role);if(parsed.data.client==="web"){setRefresh(res,result.refresh);setAccess(res,access)}res.json({accessToken:parsed.data.client==="native"?access:undefined,refreshToken:parsed.data.client==="native"?result.refresh:undefined})});
-app.post("/auth/logout",async(req,res)=>{const raw=cookie(req,refreshCookieName)||z.string().min(32).safeParse(req.body?.refreshToken).data;if(raw)await pool.query("UPDATE sessions SET revoked_at=now() WHERE refresh_token_hash=$1",[hashToken(raw)]);clearCookies(res);res.status(204).send()});
-app.post("/auth/refresh",async(req,res)=>{const cookieRefresh=cookie(req,refreshCookieName);const raw=cookieRefresh||z.string().min(32).safeParse(req.body?.refreshToken).data;if(!raw)return res.status(401).json({error:"invalid_refresh"});const result=await withTx(async c=>{const q=await c.query("SELECT s.id,s.user_id,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.refresh_token_hash=$1 AND s.revoked_at IS NULL AND s.expires_at>now() FOR UPDATE",[hashToken(raw)]);const row=q.rows[0];if(!row)throw new Error("invalid_refresh");const next=issueRefreshToken();await c.query("UPDATE sessions SET revoked_at=now() WHERE id=$1",[row.id]);await c.query("INSERT INTO sessions(user_id,refresh_token_hash,expires_at) VALUES($1,$2,now()+interval '30 days')",[row.user_id,hashToken(next)]);return{userId:row.user_id,role:row.role,next}}).catch(()=>null);if(!result)return res.status(401).json({error:"invalid_refresh"});const access=issueAccessToken(result.userId,result.role);if(cookieRefresh){setRefresh(res,result.next);setAccess(res,access);return res.json({ok:true})}res.json({accessToken:access,refreshToken:result.next})});
-app.get("/me",auth,async(req,res)=>{const q=await pool.query("SELECT id,role,is_active,created_at FROM users WHERE id=$1",[(req as any).user.sub]);if(!q.rows[0]||!q.rows[0].is_active)return res.status(401).json({error:"inactive_account"});res.json({user:q.rows[0]})});
-app.post("/orders",auth,async(req,res)=>{const body=z.object({pages:z.number().int().positive().max(500)}).safeParse(req.body);if(!body.success)return res.status(400).json({error:"invalid_request"});const amounts=orderAmounts(body.data.pages);const created=await withTx(async c=>{const id=publicOrderId();const q=await c.query("INSERT INTO orders(public_id,customer_id,pages,price_paise,payout_paise,status) VALUES($1,$2,$3,$4,$5,'DRAFT') RETURNING public_id,pages,price_paise,payout_paise,status",[id,(req as any).user.sub,body.data.pages,amounts.pricePaise,amounts.payoutPaise]);await c.query("INSERT INTO order_events(order_id,to_status,actor_user_id,metadata) SELECT id,status,$2,'{}' FROM orders WHERE public_id=$1",[id,(req as any).user.sub]);return q.rows[0]});res.status(201).json({id:created.public_id,pages:created.pages,price:created.price_paise/100,payout:created.payout_paise/100,status:created.status})});
-app.get("/orders",auth,async(req,res)=>{const q=await pool.query("SELECT public_id,pages,price_paise,payout_paise,status,created_at,updated_at FROM orders WHERE customer_id=$1 ORDER BY created_at DESC LIMIT 50",[(req as any).user.sub]);res.json({orders:q.rows.map(x=>({...x,price:x.price_paise/100}))})});
-app.get("/wallet",auth,role("SCRIBE"),async(req,res)=>{const q=await pool.query("SELECT e.id,e.amount_paise,e.status,o.public_id,o.pages,o.created_at FROM escrow_entries e JOIN orders o ON o.id=e.order_id WHERE o.scribe_id=$1 AND e.kind='SCRIBE_PAYOUT' ORDER BY e.created_at DESC LIMIT 50",[(req as any).user.sub]);const available=q.rows.filter(x=>x.status==="RELEASED").reduce((n,x)=>n+x.amount_paise,0);const pending=q.rows.filter(x=>x.status!=="RELEASED").reduce((n,x)=>n+x.amount_paise,0);res.json({available:available/100,pending:pending/100,entries:q.rows.map(x=>({id:x.id,label:`Order ${x.public_id} · ${x.pages} pages`,amount:x.amount_paise/100,status:x.status==="RELEASED"?"Released":"In escrow"}))})});app.get("/orders/:id",auth,async(req,res)=>{const q=await pool.query("SELECT public_id,pages,price_paise,payout_paise,status,created_at,updated_at FROM orders WHERE public_id=$1 AND customer_id=$2",[req.params.id,(req as any).user.sub]);if(!q.rows[0])return res.status(404).json({error:"not_found"});res.json({...q.rows[0],price:q.rows[0].price_paise/100})});
-app.post("/orders/:id/transition",auth,async(req,res)=>{const body=z.object({to:z.enum(["CANCELLED"])}).safeParse(req.body);if(!body.success)return res.status(400).json({error:"invalid_request"});const result=await withTx(async c=>{const q=await c.query("SELECT id,status FROM orders WHERE public_id=$1 AND customer_id=$2 FOR UPDATE",[req.params.id,(req as any).user.sub]);const o=q.rows[0];if(!o)return null;if(!canTransition(o.status,body.data.to))throw new Error("invalid_transition");await c.query("UPDATE orders SET status=$1,version=version+1,updated_at=now() WHERE id=$2",[body.data.to,o.id]);await c.query("INSERT INTO order_events(order_id,from_status,to_status,actor_user_id) VALUES($1,$2,$3,$4)",[o.id,o.status,body.data.to,(req as any).user.sub]);return{status:body.data.to}}).catch(e=>e instanceof Error&&e.message==="invalid_transition"?"invalid_transition":null);if(result===null)return res.status(404).json({error:"not_found"});if(result==="invalid_transition")return res.status(409).json({error:"invalid_transition"});res.json(result)});
-app.post("/admin/audit-test",auth,role("ADMIN"),(_,res)=>res.json({ok:true}));
-const port=Number(process.env.PORT||4000);app.listen(port,"0.0.0.0",()=>console.log(`ScribeLink API listening on ${port}`));
+import "dotenv/config";
+import express from "express";
+import cors from "cors";
+import helmet from "helmet";
+import rateLimit from "express-rate-limit";
+import { z } from "zod";
+import { auth, role } from "./middleware.js";
+import { hashToken, issueAccessToken, issueRefreshToken, otp, requestId } from "./security.js";
+import { pool, withTx } from "./db.js";
+import { canTransition, orderAmounts, publicOrderId } from "./domain.js";
+import { marketplace, publicMarketplace } from "./marketplace.js";
+
+if (!process.env.DATABASE_URL) throw new Error("DATABASE_URL must be set");
+if (!process.env.JWT_SECRET || process.env.JWT_SECRET.length < 32) throw new Error("JWT_SECRET must be set and at least 32 characters");
+
+const app = express();
+app.disable("x-powered-by");
+app.set("trust proxy", 1);
+
+const allowedOrigins = (process.env.WEB_ORIGIN || "").split(",").map(x => x.trim()).filter(Boolean);
+app.use(helmet({ crossOriginResourcePolicy: { policy: "same-site" } }));
+app.use(cors({ origin: allowedOrigins.length ? allowedOrigins : false, credentials: true }));
+app.use(express.json({ limit: "1mb", verify: (req:any, _res, buf) => { req.rawBody = Buffer.from(buf); } }));
+app.use((req,res,next) => {
+  res.setHeader("x-request-id", requestId());
+  res.setHeader("Cache-Control", "no-store");
+  next();
+});
+app.use(rateLimit({ windowMs: 60_000, max: 120, standardHeaders: true, legacyHeaders: false }));
+
+async function health(_req:express.Request,res:express.Response) {
+  try {
+    await pool.query("SELECT 1");
+    return res.status(200).json({ ok:true, service:"scribelink-api" });
+  } catch {
+    return res.status(503).json({ ok:false, service:"scribelink-api" });
+  }
+}
+app.get("/health", health);
+app.get("/healthz", health);
+
+app.use(publicMarketplace);
+app.use(marketplace);
+
+const otpLimit = rateLimit({ windowMs: 10*60_000, max: 5, standardHeaders: true, legacyHeaders: false });
+const otpVerifyLimit = rateLimit({ windowMs: 10*60_000, max: 10, standardHeaders: true, legacyHeaders: false });
+
+function cookie(req:express.Request,name:string) {
+  const raw = req.header("cookie") || "";
+  return raw.split(";").map(x => x.trim()).find(x => x.startsWith(name+"="))?.slice(name.length+1);
+}
+const prod = process.env.NODE_ENV === "production";
+const refreshCookieName = prod ? "__Host-refresh_token" : "refresh_token";
+const accessCookieName = prod ? "__Host-access_token" : "access_token";
+
+function setRefresh(res:express.Response,value:string) {
+  res.setHeader("Set-Cookie", `${refreshCookieName}=${value}; Max-Age=2592000; Path=/; HttpOnly; ${prod?"Secure; ":""}SameSite=Lax`);
+}
+function setAccess(res:express.Response,value:string) {
+  res.append("Set-Cookie", `${accessCookieName}=${value}; Max-Age=900; Path=/; HttpOnly; ${prod?"Secure; ":""}SameSite=Lax`);
+}
+function clearCookies(res:express.Response) {
+  const secure = prod ? "Secure; " : "";
+  res.setHeader("Set-Cookie", [
+    `${refreshCookieName}=; Max-Age=0; Path=/; HttpOnly; ${secure}SameSite=Lax`,
+    `${accessCookieName}=; Max-Age=0; Path=/; HttpOnly; ${secure}SameSite=Lax`,
+  ]);
+}
+
+app.post("/auth/request-otp", otpLimit, async (req,res) => {
+  const parsed = z.object({ phone:z.string().trim().regex(/^\+[1-9]\d{7,14}$/) }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error:"invalid_request" });
+  const phone = parsed.data.phone;
+  const code = otp();
+  await pool.query("INSERT INTO auth_challenges(phone_e164,otp_hash,expires_at) VALUES($1,$2,now()+interval '5 minutes')",[phone,hashToken(code)]);
+  res.json({ accepted:true, expiresIn:300, developmentOtp:process.env.NODE_ENV==="development"?code:undefined });
+});
+
+app.post("/auth/verify-otp", otpVerifyLimit, async (req,res) => {
+  const parsed = z.object({
+    phone:z.string().trim().regex(/^\+[1-9]\d{7,14}$/),
+    code:z.string().regex(/^\d{6}$/),
+    client:z.enum(["web","native"]).default("native"),
+  }).safeParse(req.body);
+  if (!parsed.success) return res.status(400).json({ error:"invalid_request" });
+  const { phone, code } = parsed.data;
+  const result = await withTx(async c => {
+    const q = await c.query("SELECT id,otp_hash,expires_at,attempts FROM auth_challenges WHERE phone_e164=$1 AND consumed_at IS NULL ORDER BY created_at DESC LIMIT 1 FOR UPDATE",[phone]);
+    const ch = q.rows[0];
+    if (!ch || new Date(ch.expires_at) < new Date() || ch.attempts >= 5) throw new Error("invalid_otp");
+    if (hashToken(code) !== ch.otp_hash) {
+      await c.query("UPDATE auth_challenges SET attempts=attempts+1 WHERE id=$1",[ch.id]);
+      throw new Error("invalid_otp");
+    }
+    await c.query("UPDATE auth_challenges SET consumed_at=now() WHERE id=$1",[ch.id]);
+    const u = await c.query("INSERT INTO users(phone_e164) VALUES($1) ON CONFLICT(phone_e164) DO UPDATE SET updated_at=now() RETURNING id,role",[phone]);
+    const refresh = issueRefreshToken();
+    await c.query("INSERT INTO sessions(user_id,refresh_token_hash,expires_at) VALUES($1,$2,now()+interval '30 days')",[u.rows[0].id,hashToken(refresh)]);
+    return { user:u.rows[0], refresh };
+  }).catch(() => null);
+  if (!result) return res.status(401).json({ error:"invalid_otp" });
+  const access = issueAccessToken(result.user.id,result.user.role);
+  if (parsed.data.client === "web") {
+    setRefresh(res,result.refresh);
+    setAccess(res,access);
+  }
+  res.json({ accessToken:parsed.data.client==="native"?access:undefined, refreshToken:parsed.data.client==="native"?result.refresh:undefined });
+});
+
+app.post("/auth/logout", async (req,res) => {
+  const raw = cookie(req,refreshCookieName) || z.string().min(32).safeParse(req.body?.refreshToken).data;
+  if (raw) await pool.query("UPDATE sessions SET revoked_at=now() WHERE refresh_token_hash=$1",[hashToken(raw)]);
+  clearCookies(res);
+  res.status(204).send();
+});
+
+app.post("/auth/refresh", async (req,res) => {
+  const cookieRefresh = cookie(req,refreshCookieName);
+  const raw = cookieRefresh || z.string().min(32).safeParse(req.body?.refreshToken).data;
+  if (!raw) return res.status(401).json({ error:"invalid_refresh" });
+  const result = await withTx(async c => {
+    const q = await c.query("SELECT s.id,s.user_id,u.role FROM sessions s JOIN users u ON u.id=s.user_id WHERE s.refresh_token_hash=$1 AND s.revoked_at IS NULL AND s.expires_at>now() FOR UPDATE",[hashToken(raw)]);
+    const row = q.rows[0];
+    if (!row) throw new Error("invalid_refresh");
+    const next = issueRefreshToken();
+    await c.query("UPDATE sessions SET revoked_at=now() WHERE id=$1",[row.id]);
+    await c.query("INSERT INTO sessions(user_id,refresh_token_hash,expires_at) VALUES($1,$2,now()+interval '30 days')",[row.user_id,hashToken(next)]);
+    return { userId:row.user_id, role:row.role, next };
+  }).catch(() => null);
+  if (!result) return res.status(401).json({ error:"invalid_refresh" });
+  const access = issueAccessToken(result.userId,result.role);
+  if (cookieRefresh) {
+    setRefresh(res,result.next);
+    setAccess(res,access);
+    return res.json({ ok:true });
+  }
+  res.json({ accessToken:access, refreshToken:result.next });
+});
+
+app.get("/me", auth, async (req,res) => {
+  const q = await pool.query("SELECT id,role,is_active,created_at FROM users WHERE id=$1",[(req as any).user.sub]);
+  if (!q.rows[0] || !q.rows[0].is_active) return res.status(401).json({ error:"inactive_account" });
+  res.json({ user:q.rows[0] });
+});
+
+app.post("/orders", auth, async (req,res) => {
+  const body = z.object({ pages:z.number().int().positive().max(500), handwritingStyle:z.string().trim().max(80).optional() }).safeParse(req.body);
+  if (!body.success) return res.status(400).json({ error:"invalid_request" });
+  const amounts = orderAmounts(body.data.pages);
+  const created = await withTx(async c => {
+    const id = publicOrderId();
+    const q = await c.query("INSERT INTO orders(public_id,customer_id,pages,price_paise,payout_paise,status) VALUES($1,$2,$3,$4,$5,'DRAFT') RETURNING public_id,pages,price_paise,payout_paise,status",[id,(req as any).user.sub,body.data.pages,amounts.pricePaise,amounts.payoutPaise]);
+    await c.query("INSERT INTO order_events(order_id,to_status,actor_user_id,metadata) SELECT id,status,$2,$3::jsonb FROM orders WHERE public_id=$1",[id,(req as any).user.sub,JSON.stringify({handwritingStyle:body.data.handwritingStyle||null})]);
+    return q.rows[0];
+  });
+  res.status(201).json({ id:created.public_id, pages:created.pages, price:created.price_paise/100, payout:created.payout_paise/100, status:created.status });
+});
+
+app.get("/orders", auth, async (req,res) => {
+  const q = await pool.query("SELECT public_id,pages,price_paise,payout_paise,status,created_at,updated_at FROM orders WHERE customer_id=$1 ORDER BY created_at DESC LIMIT 50",[(req as any).user.sub]);
+  res.json({ orders:q.rows.map(x => ({...x,price:x.price_paise/100})) });
+});
+
+app.get("/wallet", auth, role("SCRIBE"), async (req,res) => {
+  const q = await pool.query("SELECT e.id,e.amount_paise,e.status,o.public_id,o.pages,o.created_at FROM escrow_entries e JOIN orders o ON o.id=e.order_id WHERE o.scribe_id=$1 AND e.kind='SCRIBE_PAYOUT' ORDER BY e.created_at DESC LIMIT 50",[(req as any).user.sub]);
+  const available=q.rows.filter(x=>x.status==="RELEASED").reduce((n,x)=>n+x.amount_paise,0);
+  const pending=q.rows.filter(x=>x.status!=="RELEASED").reduce((n,x)=>n+x.amount_paise,0);
+  res.json({available:available/100,pending:pending/100,entries:q.rows.map(x=>({id:x.id,label:`Order ${x.public_id} · ${x.pages} pages`,amount:x.amount_paise/100,status:x.status==="RELEASED"?"Released":"In escrow"}))});
+});
+
+app.get("/orders/:id", auth, async (req,res) => {
+  const q = await pool.query("SELECT public_id,pages,price_paise,payout_paise,status,created_at,updated_at FROM orders WHERE public_id=$1 AND customer_id=$2",[req.params.id,(req as any).user.sub]);
+  if (!q.rows[0]) return res.status(404).json({error:"not_found"});
+  res.json({...q.rows[0],price:q.rows[0].price_paise/100});
+});
+
+app.post("/orders/:id/transition", auth, async (req,res) => {
+  const body=z.object({to:z.enum(["CANCELLED"])}).safeParse(req.body);
+  if(!body.success)return res.status(400).json({error:"invalid_request"});
+  const result=await withTx(async c=>{
+    const q=await c.query("SELECT id,status FROM orders WHERE public_id=$1 AND customer_id=$2 FOR UPDATE",[req.params.id,(req as any).user.sub]);
+    const o=q.rows[0]; if(!o)return null;
+    if(!canTransition(o.status,body.data.to))throw new Error("invalid_transition");
+    await c.query("UPDATE orders SET status=$1,version=version+1,updated_at=now() WHERE id=$2",[body.data.to,o.id]);
+    await c.query("INSERT INTO order_events(order_id,from_status,to_status,actor_user_id) VALUES($1,$2,$3,$4)",[o.id,o.status,body.data.to,(req as any).user.sub]);
+    return {status:body.data.to};
+  }).catch(e=>e instanceof Error&&e.message==="invalid_transition"?"invalid_transition":null);
+  if(result===null)return res.status(404).json({error:"not_found"});
+  if(result==="invalid_transition")return res.status(409).json({error:"invalid_transition"});
+  res.json(result);
+});
+
+app.post("/admin/audit-test", auth, role("ADMIN"), (_req,res) => res.json({ok:true}));
+
+const port=Number(process.env.PORT||4000);
+app.listen(port,"0.0.0.0",()=>console.log(`ScribeLink API listening on ${port}`));
